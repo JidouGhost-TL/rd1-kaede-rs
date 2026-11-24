@@ -4,7 +4,7 @@ use core::fmt;
 
 /// Errors returned when parsing Nintendo R&D1 Kaede sample descriptors, song tables,
 /// Standard MIDI chunks, or synthesis parameters.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum Error {
     /// Input buffer ended before a complete header or payload could be read.

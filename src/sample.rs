@@ -231,7 +231,7 @@ impl KaedeMidiHeader {
 }
 
 /// Zero-copy borrowed view of a Nintendo R&D1 Kaede signed 8-bit PCM sample.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct KaedeSampleView<'a> {
     /// Sample index or identifier.
     pub id: u32,
@@ -298,11 +298,24 @@ impl<'a> KaedeSampleView<'a> {
     pub const fn is_empty(&self) -> bool {
         self.pcm_bytes.is_empty()
     }
+
+    /// Clone this borrowed view into an owned [`KaedeSample`] (requires `alloc` feature).
+    #[cfg(feature = "alloc")]
+    #[must_use]
+    pub fn to_owned_sample(&self) -> KaedeSample {
+        KaedeSample {
+            id: self.id,
+            sample_rate_hz: self.sample_rate_hz,
+            root_note: self.root_note,
+            loop_range: self.loop_range,
+            pcm_bytes: self.pcm_bytes.to_vec(),
+        }
+    }
 }
 
 /// Owned Nintendo R&D1 Kaede signed 8-bit PCM sample (requires `alloc` feature).
 #[cfg(feature = "alloc")]
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct KaedeSample {
     /// Sample index or identifier.
     pub id: u32,
@@ -329,6 +342,20 @@ impl KaedeSample {
             loop_range: self.loop_range,
             pcm_bytes: &self.pcm_bytes,
         }
+    }
+
+    /// Number of 8-bit mono samples in the buffer.
+    #[inline]
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.pcm_bytes.len()
+    }
+
+    /// Returns `true` if the sample buffer is empty.
+    #[inline]
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.pcm_bytes.is_empty()
     }
 }
 

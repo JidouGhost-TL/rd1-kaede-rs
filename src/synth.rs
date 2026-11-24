@@ -44,13 +44,55 @@ pub const KAEDE_CLAMP_LUT_512: [i8; 512] = build_kaede_clamping_lut::<512>();
 /// (*Rhythm Tengoku*).
 pub const KAEDE_CLAMP_LUT_1024: [i8; 1024] = build_kaede_clamping_lut::<1024>();
 
+/// Branchless, auto-vectorizable equivalent of `KAEDE_CLAMP_LUT_512[((acc as u32) >> 7) & 0x1FF]`.
+///
+/// Sign-extends bits `7..=15` of `acc` into `[-256, +255]`, saturates to `[-128, +127]`,
+/// and reproduces the authentic `lut[0x1FF] = 0` (`s == -1 -> 0`) quirk.
+#[inline(always)]
+const fn clamp_dma8_v1(acc: i32) -> i8 {
+    let s = (acc << 16) >> 23;
+    let clamped = if s > 127 {
+        127
+    } else if s < -128 {
+        -128
+    } else {
+        s
+    };
+    if s == -1 {
+        0
+    } else {
+        clamped as i8
+    }
+}
+
+/// Branchless, auto-vectorizable equivalent of `KAEDE_CLAMP_LUT_1024[((acc as u32) >> 7) & 0x3FF]`.
+///
+/// Sign-extends bits `7..=16` of `acc` into `[-512, +511]`, saturates to `[-128, +127]`,
+/// and reproduces the authentic `lut[0x3FF] = 0` (`s == -1 -> 0`) quirk.
+#[inline(always)]
+const fn clamp_dma8_v2(acc: i32) -> i8 {
+    let s = (acc << 15) >> 22;
+    let clamped = if s > 127 {
+        127
+    } else if s < -128 {
+        -128
+    } else {
+        s
+    };
+    if s == -1 {
+        0
+    } else {
+        clamped as i8
+    }
+}
+
 // ============================================================================
 // AccuracySynth: Bit-Exact ARM7TDMI Software Mixer Emulation
 // ============================================================================
 
 /// Bit-exact software synthesizer implementing all 10 ARM7TDMI mixer kernels of the
 /// Nintendo R&D1 "Kaede" DirectSound engine.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct AccuracySynth;
 
 impl AccuracySynth {
@@ -98,30 +140,91 @@ impl AccuracySynth {
         let loop_delta = voice.loop_delta_q14();
         let vol_l = voice.vol_l;
         let vol_r = voice.vol_r;
-        let mut fp = voice.phase_q14;
-        let mut out_idx = 0usize;
+        let max_safe_fp = if pcm_len > 1 {
+            ((pcm_len - 1).min(0x3_FFFF) as u32) << 14
+        } else {
+            0
+        };
+        let can_interior = step < (1 << 30) && end_fp <= max_safe_fp;
 
-        for _ in 0..blocks {
+        let mut fp = voice.phase_q14;
+        let mut block_idx = 0usize;
+
+        while block_idx < blocks {
+            if can_interior && fp < end_fp {
+                let run_blocks = if step4 == 0 {
+                    blocks - block_idx
+                } else {
+                    (((end_fp - 1 - fp) as u64) / (step4 as u64)) as usize
+                }
+                .min(blocks - block_idx);
+
+                if run_blocks > 0 {
+                    let slice = &mut acc[block_idx * 8..(block_idx + run_blocks) * 8];
+                    for chunk in slice.as_chunks_mut::<8>().0 {
+                        let fp0 = fp;
+                        let fp1 = fp0.wrapping_add(step);
+                        let fp2 = fp1.wrapping_add(step);
+                        let fp3 = fp2.wrapping_add(step);
+                        fp = fp0.wrapping_add(step4);
+
+                        let i0 = (fp0 >> 14) as usize;
+                        let s0b = pcm_bytes[i0 + 1] as i8 as i32;
+                        let s0a = pcm_bytes[i0] as i8 as i32;
+                        let v0 = s0a + (((s0b - s0a) * ((fp0 & Q14_INTERP_MASK) as i32)) >> 14);
+
+                        let i1 = (fp1 >> 14) as usize;
+                        let s1b = pcm_bytes[i1 + 1] as i8 as i32;
+                        let s1a = pcm_bytes[i1] as i8 as i32;
+                        let v1 = s1a + (((s1b - s1a) * ((fp1 & Q14_INTERP_MASK) as i32)) >> 14);
+
+                        let i2 = (fp2 >> 14) as usize;
+                        let s2b = pcm_bytes[i2 + 1] as i8 as i32;
+                        let s2a = pcm_bytes[i2] as i8 as i32;
+                        let v2 = s2a + (((s2b - s2a) * ((fp2 & Q14_INTERP_MASK) as i32)) >> 14);
+
+                        let i3 = (fp3 >> 14) as usize;
+                        let s3b = pcm_bytes[i3 + 1] as i8 as i32;
+                        let s3a = pcm_bytes[i3] as i8 as i32;
+                        let v3 = s3a + (((s3b - s3a) * ((fp3 & Q14_INTERP_MASK) as i32)) >> 14);
+
+                        chunk[0] = chunk[0].wrapping_add(v0.wrapping_mul(vol_l));
+                        chunk[1] = chunk[1].wrapping_add(v0.wrapping_mul(vol_r));
+                        chunk[2] = chunk[2].wrapping_add(v1.wrapping_mul(vol_l));
+                        chunk[3] = chunk[3].wrapping_add(v1.wrapping_mul(vol_r));
+                        chunk[4] = chunk[4].wrapping_add(v2.wrapping_mul(vol_l));
+                        chunk[5] = chunk[5].wrapping_add(v2.wrapping_mul(vol_r));
+                        chunk[6] = chunk[6].wrapping_add(v3.wrapping_mul(vol_l));
+                        chunk[7] = chunk[7].wrapping_add(v3.wrapping_mul(vol_r));
+                    }
+                    block_idx += run_blocks;
+                    continue;
+                }
+            }
+
             if fp.wrapping_add(step4) < end_fp {
-                for _ in 0..4 {
+                let block = &mut acc[block_idx * 8..(block_idx + 1) * 8];
+                for pair in block.as_chunks_mut::<2>().0 {
                     let s = interp_q14_sample(pcm_bytes, pcm_len, fp);
-                    acc[out_idx] = acc[out_idx].wrapping_add(s.wrapping_mul(vol_l));
-                    acc[out_idx + 1] = acc[out_idx + 1].wrapping_add(s.wrapping_mul(vol_r));
-                    out_idx += 2;
+                    pair[0] = pair[0].wrapping_add(s.wrapping_mul(vol_l));
+                    pair[1] = pair[1].wrapping_add(s.wrapping_mul(vol_r));
                     fp = fp.wrapping_add(step);
                 }
+                block_idx += 1;
             } else if loop_delta != 0 {
-                for _ in 0..4 {
+                let block = &mut acc[block_idx * 8..(block_idx + 1) * 8];
+                for pair in block.as_chunks_mut::<2>().0 {
                     let s = interp_q14_sample(pcm_bytes, pcm_len, fp);
-                    acc[out_idx] = acc[out_idx].wrapping_add(s.wrapping_mul(vol_l));
-                    acc[out_idx + 1] = acc[out_idx + 1].wrapping_add(s.wrapping_mul(vol_r));
-                    out_idx += 2;
+                    pair[0] = pair[0].wrapping_add(s.wrapping_mul(vol_l));
+                    pair[1] = pair[1].wrapping_add(s.wrapping_mul(vol_r));
                     fp = fp.wrapping_add(step);
                     while fp >= end_fp {
                         fp = fp.wrapping_add(loop_delta as u32);
                     }
                 }
+                block_idx += 1;
             } else {
+                let mut out_idx = block_idx * 8;
                 loop {
                     let s = interp_q14_sample(pcm_bytes, pcm_len, fp);
                     acc[out_idx] = acc[out_idx].wrapping_add(s.wrapping_mul(vol_l));
@@ -158,28 +261,83 @@ impl AccuracySynth {
         let end_fp = voice.end_q14;
         let loop_delta = voice.loop_delta_q14();
         let vol = voice.vol_l;
-        let mut fp = voice.phase_q14;
-        let mut out_idx = 0usize;
+        let max_safe_fp = if pcm_len > 1 {
+            ((pcm_len - 1).min(0x3_FFFF) as u32) << 14
+        } else {
+            0
+        };
+        let can_interior = step < (1 << 30) && end_fp <= max_safe_fp;
 
-        for _ in 0..blocks {
+        let mut fp = voice.phase_q14;
+        let mut block_idx = 0usize;
+
+        while block_idx < blocks {
+            if can_interior && fp < end_fp {
+                let run_blocks = if step4 == 0 {
+                    blocks - block_idx
+                } else {
+                    (((end_fp - 1 - fp) as u64) / (step4 as u64)) as usize
+                }
+                .min(blocks - block_idx);
+
+                if run_blocks > 0 {
+                    let slice = &mut acc[block_idx * 4..(block_idx + run_blocks) * 4];
+                    for chunk in slice.as_chunks_mut::<4>().0 {
+                        let fp0 = fp;
+                        let fp1 = fp0.wrapping_add(step);
+                        let fp2 = fp1.wrapping_add(step);
+                        let fp3 = fp2.wrapping_add(step);
+                        fp = fp0.wrapping_add(step4);
+
+                        let i0 = (fp0 >> 14) as usize;
+                        let s0b = pcm_bytes[i0 + 1] as i8 as i32;
+                        let s0a = pcm_bytes[i0] as i8 as i32;
+                        let v0 = s0a + (((s0b - s0a) * ((fp0 & Q14_INTERP_MASK) as i32)) >> 14);
+
+                        let i1 = (fp1 >> 14) as usize;
+                        let s1b = pcm_bytes[i1 + 1] as i8 as i32;
+                        let s1a = pcm_bytes[i1] as i8 as i32;
+                        let v1 = s1a + (((s1b - s1a) * ((fp1 & Q14_INTERP_MASK) as i32)) >> 14);
+
+                        let i2 = (fp2 >> 14) as usize;
+                        let s2b = pcm_bytes[i2 + 1] as i8 as i32;
+                        let s2a = pcm_bytes[i2] as i8 as i32;
+                        let v2 = s2a + (((s2b - s2a) * ((fp2 & Q14_INTERP_MASK) as i32)) >> 14);
+
+                        let i3 = (fp3 >> 14) as usize;
+                        let s3b = pcm_bytes[i3 + 1] as i8 as i32;
+                        let s3a = pcm_bytes[i3] as i8 as i32;
+                        let v3 = s3a + (((s3b - s3a) * ((fp3 & Q14_INTERP_MASK) as i32)) >> 14);
+
+                        chunk[0] = chunk[0].wrapping_add(v0.wrapping_mul(vol));
+                        chunk[1] = chunk[1].wrapping_add(v1.wrapping_mul(vol));
+                        chunk[2] = chunk[2].wrapping_add(v2.wrapping_mul(vol));
+                        chunk[3] = chunk[3].wrapping_add(v3.wrapping_mul(vol));
+                    }
+                    block_idx += run_blocks;
+                    continue;
+                }
+            }
+
             if fp.wrapping_add(step4) < end_fp {
-                for _ in 0..4 {
+                for out in &mut acc[block_idx * 4..(block_idx + 1) * 4] {
                     let s = interp_q14_sample(pcm_bytes, pcm_len, fp);
-                    acc[out_idx] = acc[out_idx].wrapping_add(s.wrapping_mul(vol));
-                    out_idx += 1;
+                    *out = out.wrapping_add(s.wrapping_mul(vol));
                     fp = fp.wrapping_add(step);
                 }
+                block_idx += 1;
             } else if loop_delta != 0 {
-                for _ in 0..4 {
+                for out in &mut acc[block_idx * 4..(block_idx + 1) * 4] {
                     let s = interp_q14_sample(pcm_bytes, pcm_len, fp);
-                    acc[out_idx] = acc[out_idx].wrapping_add(s.wrapping_mul(vol));
-                    out_idx += 1;
+                    *out = out.wrapping_add(s.wrapping_mul(vol));
                     fp = fp.wrapping_add(step);
                     while fp >= end_fp {
                         fp = fp.wrapping_add(loop_delta as u32);
                     }
                 }
+                block_idx += 1;
             } else {
+                let mut out_idx = block_idx * 4;
                 loop {
                     let s = interp_q14_sample(pcm_bytes, pcm_len, fp);
                     acc[out_idx] = acc[out_idx].wrapping_add(s.wrapping_mul(vol));
@@ -228,30 +386,66 @@ impl AccuracySynth {
         let mut pos_l = state.pos_l % len_l;
         let mut pos_r = state.pos_r % len_r;
         let mut out_idx = 0usize;
+        let mut rem_blocks = blocks;
 
-        for _ in 0..blocks {
-            for _ in 0..4 {
-                let sl = delay_l[pos_l] as i8 as i32;
-                pos_l += 1;
-                hp_l = hp_l.wrapping_sub(hp_l >> hp_sh).wrapping_add(sl);
-                let hpo_l = sl.wrapping_sub(hp_l >> hp_sh);
-                lp_l = lp_l.wrapping_sub(lp_l >> lp_sh).wrapping_add(hpo_l);
-                out_acc[out_idx] = lp_l.wrapping_mul(vol);
+        while rem_blocks > 0 {
+            let run_blocks = ((len_l - pos_l) / 4)
+                .min((len_r - pos_r) / 4)
+                .min(rem_blocks);
+            if run_blocks > 0 {
+                let run_frames = run_blocks * 4;
+                let dl = &delay_l[pos_l..pos_l + run_frames];
+                let dr = &delay_r[pos_r..pos_r + run_frames];
+                let out = &mut out_acc[out_idx..out_idx + run_frames * 2];
+                for ((&bl, &br), pair) in dl.iter().zip(dr).zip(out.as_chunks_mut::<2>().0) {
+                    let sl = bl as i8 as i32;
+                    let sr = br as i8 as i32;
+                    // Group L+R HP shifts together to halve `cl` shift-count reloads on x86_64
+                    hp_l = hp_l.wrapping_sub(hp_l >> hp_sh).wrapping_add(sl);
+                    let hpo_l = sl.wrapping_sub(hp_l >> hp_sh);
+                    hp_r = hp_r.wrapping_sub(hp_r >> hp_sh).wrapping_add(sr);
+                    let hpo_r = sr.wrapping_sub(hp_r >> hp_sh);
 
-                let sr = delay_r[pos_r] as i8 as i32;
-                pos_r += 1;
-                hp_r = hp_r.wrapping_sub(hp_r >> hp_sh).wrapping_add(sr);
-                let hpo_r = sr.wrapping_sub(hp_r >> hp_sh);
-                lp_r = lp_r.wrapping_sub(lp_r >> lp_sh).wrapping_add(hpo_r);
-                out_acc[out_idx + 1] = lp_r.wrapping_mul(vol);
+                    lp_l = lp_l.wrapping_sub(lp_l >> lp_sh).wrapping_add(hpo_l);
+                    lp_r = lp_r.wrapping_sub(lp_r >> lp_sh).wrapping_add(hpo_r);
+                    pair[0] = lp_l.wrapping_mul(vol);
+                    pair[1] = lp_r.wrapping_mul(vol);
+                }
+                pos_l += run_frames;
+                pos_r += run_frames;
+                if pos_l >= len_l {
+                    pos_l = 0;
+                }
+                if pos_r >= len_r {
+                    pos_r = 0;
+                }
+                out_idx += run_frames * 2;
+                rem_blocks -= run_blocks;
+            } else {
+                let block = &mut out_acc[out_idx..out_idx + 8];
+                for pair in block.as_chunks_mut::<2>().0 {
+                    let sl = delay_l[pos_l % len_l] as i8 as i32;
+                    pos_l += 1;
+                    hp_l = hp_l.wrapping_sub(hp_l >> hp_sh).wrapping_add(sl);
+                    let hpo_l = sl.wrapping_sub(hp_l >> hp_sh);
+                    lp_l = lp_l.wrapping_sub(lp_l >> lp_sh).wrapping_add(hpo_l);
+                    pair[0] = lp_l.wrapping_mul(vol);
 
-                out_idx += 2;
-            }
-            if pos_l >= len_l {
-                pos_l = 0;
-            }
-            if pos_r >= len_r {
-                pos_r = 0;
+                    let sr = delay_r[pos_r % len_r] as i8 as i32;
+                    pos_r += 1;
+                    hp_r = hp_r.wrapping_sub(hp_r >> hp_sh).wrapping_add(sr);
+                    let hpo_r = sr.wrapping_sub(hp_r >> hp_sh);
+                    lp_r = lp_r.wrapping_sub(lp_r >> lp_sh).wrapping_add(hpo_r);
+                    pair[1] = lp_r.wrapping_mul(vol);
+                }
+                if pos_l >= len_l {
+                    pos_l = 0;
+                }
+                if pos_r >= len_r {
+                    pos_r = 0;
+                }
+                out_idx += 8;
+                rem_blocks -= 1;
             }
         }
 
@@ -288,19 +482,42 @@ impl AccuracySynth {
         let mut lp = state.lp_l;
         let mut pos = state.pos_l % len;
         let mut out_idx = 0usize;
+        let mut rem_blocks = blocks;
 
-        for _ in 0..blocks {
-            for _ in 0..4 {
-                let s = delay_buf[pos] as i8 as i32;
-                pos += 1;
-                hp = hp.wrapping_sub(hp >> hp_sh).wrapping_add(s);
-                let hpo = s.wrapping_sub(hp >> hp_sh);
-                lp = lp.wrapping_sub(lp >> lp_sh).wrapping_add(hpo);
-                out_acc[out_idx] = lp.wrapping_mul(vol);
-                out_idx += 1;
-            }
-            if pos >= len {
-                pos -= len;
+        while rem_blocks > 0 {
+            let run_blocks = ((len - pos) / 4).min(rem_blocks);
+            if run_blocks > 0 {
+                let run_frames = run_blocks * 4;
+                for (&b, out) in delay_buf[pos..pos + run_frames]
+                    .iter()
+                    .zip(&mut out_acc[out_idx..out_idx + run_frames])
+                {
+                    let s = b as i8 as i32;
+                    hp = hp.wrapping_sub(hp >> hp_sh).wrapping_add(s);
+                    let hpo = s.wrapping_sub(hp >> hp_sh);
+                    lp = lp.wrapping_sub(lp >> lp_sh).wrapping_add(hpo);
+                    *out = lp.wrapping_mul(vol);
+                }
+                pos += run_frames;
+                if pos >= len {
+                    pos -= len;
+                }
+                out_idx += run_frames;
+                rem_blocks -= run_blocks;
+            } else {
+                for out in &mut out_acc[out_idx..out_idx + 4] {
+                    let s = delay_buf[pos % len] as i8 as i32;
+                    pos += 1;
+                    hp = hp.wrapping_sub(hp >> hp_sh).wrapping_add(s);
+                    let hpo = s.wrapping_sub(hp >> hp_sh);
+                    lp = lp.wrapping_sub(lp >> lp_sh).wrapping_add(hpo);
+                    *out = lp.wrapping_mul(vol);
+                }
+                if pos >= len {
+                    pos -= len;
+                }
+                out_idx += 4;
+                rem_blocks -= 1;
             }
         }
 
@@ -323,21 +540,20 @@ impl AccuracySynth {
         let frames = (acc_interleaved.len() / 2)
             .min(dma_l.len())
             .min(dma_r.len());
+        let acc = &acc_interleaved[..frames * 2];
+        let dl = &mut dma_l[..frames];
+        let dr = &mut dma_r[..frames];
         match version {
             KaedeVersion::V1Lut512 => {
-                for i in 0..frames {
-                    let l_idx = ((acc_interleaved[i * 2] as u32) >> 7) as usize & 0x1FF;
-                    let r_idx = ((acc_interleaved[i * 2 + 1] as u32) >> 7) as usize & 0x1FF;
-                    dma_l[i] = KAEDE_CLAMP_LUT_512[l_idx];
-                    dma_r[i] = KAEDE_CLAMP_LUT_512[r_idx];
+                for ((pair, out_l), out_r) in acc.as_chunks::<2>().0.iter().zip(dl).zip(dr) {
+                    *out_l = clamp_dma8_v1(pair[0]);
+                    *out_r = clamp_dma8_v1(pair[1]);
                 }
             }
             KaedeVersion::V2Lut1024 => {
-                for i in 0..frames {
-                    let l_idx = ((acc_interleaved[i * 2] as u32) >> 7) as usize & 0x3FF;
-                    let r_idx = ((acc_interleaved[i * 2 + 1] as u32) >> 7) as usize & 0x3FF;
-                    dma_l[i] = KAEDE_CLAMP_LUT_1024[l_idx];
-                    dma_r[i] = KAEDE_CLAMP_LUT_1024[r_idx];
+                for ((pair, out_l), out_r) in acc.as_chunks::<2>().0.iter().zip(dl).zip(dr) {
+                    *out_l = clamp_dma8_v2(pair[0]);
+                    *out_r = clamp_dma8_v2(pair[1]);
                 }
             }
         }
@@ -350,15 +566,13 @@ impl AccuracySynth {
         let frames = acc_mono.len().min(dma_out.len());
         match version {
             KaedeVersion::V1Lut512 => {
-                for i in 0..frames {
-                    let idx = ((acc_mono[i] as u32) >> 7) as usize & 0x1FF;
-                    dma_out[i] = KAEDE_CLAMP_LUT_512[idx];
+                for (&a, out) in acc_mono[..frames].iter().zip(&mut dma_out[..frames]) {
+                    *out = clamp_dma8_v1(a);
                 }
             }
             KaedeVersion::V2Lut1024 => {
-                for i in 0..frames {
-                    let idx = ((acc_mono[i] as u32) >> 7) as usize & 0x3FF;
-                    dma_out[i] = KAEDE_CLAMP_LUT_1024[idx];
+                for (&a, out) in acc_mono[..frames].iter().zip(&mut dma_out[..frames]) {
+                    *out = clamp_dma8_v2(a);
                 }
             }
         }
@@ -404,12 +618,16 @@ impl AccuracySynth {
             }
 
             let run = (end_pos - pos).min(rem);
-            for &b in &pcm_bytes[pos..pos + run] {
+            let dst = &mut acc[out_idx..out_idx + run * 2];
+            for (&b, pair) in pcm_bytes[pos..pos + run]
+                .iter()
+                .zip(dst.as_chunks_mut::<2>().0)
+            {
                 let s = b as i8 as i32;
-                acc[out_idx] = acc[out_idx].wrapping_add(s.wrapping_mul(vol_l));
-                acc[out_idx + 1] = acc[out_idx + 1].wrapping_add(s.wrapping_mul(vol_r));
-                out_idx += 2;
+                pair[0] = pair[0].wrapping_add(s.wrapping_mul(vol_l));
+                pair[1] = pair[1].wrapping_add(s.wrapping_mul(vol_r));
             }
+            out_idx += run * 2;
             pos += run;
             rem -= run;
 
@@ -448,30 +666,57 @@ impl AccuracySynth {
         let loop_delta = voice.loop_delta_q14();
         let vol_l = voice.vol_l;
         let vol_r = voice.vol_r;
-        let mut fp = voice.phase_q14;
-        let mut out_idx = 0usize;
+        let max_safe_fp = (pcm_len.min(0x3_FFFF) as u32) << 14;
+        let can_interior = step < (1 << 30) && end_fp <= max_safe_fp;
 
-        for _ in 0..blocks {
+        let mut fp = voice.phase_q14;
+        let mut block_idx = 0usize;
+
+        while block_idx < blocks {
+            if can_interior && fp < end_fp {
+                let run_blocks = if step4 == 0 {
+                    blocks - block_idx
+                } else {
+                    (((end_fp - 1 - fp) as u64) / (step4 as u64)) as usize
+                }
+                .min(blocks - block_idx);
+
+                if run_blocks > 0 {
+                    let slice = &mut acc[block_idx * 8..(block_idx + run_blocks) * 8];
+                    for pair in slice.as_chunks_mut::<2>().0 {
+                        let s = pcm_bytes[(fp >> 14) as usize] as i8 as i32;
+                        pair[0] = pair[0].wrapping_add(s.wrapping_mul(vol_l));
+                        pair[1] = pair[1].wrapping_add(s.wrapping_mul(vol_r));
+                        fp = fp.wrapping_add(step);
+                    }
+                    block_idx += run_blocks;
+                    continue;
+                }
+            }
+
             if fp.wrapping_add(step4) < end_fp {
-                for _ in 0..4 {
+                let block = &mut acc[block_idx * 8..(block_idx + 1) * 8];
+                for pair in block.as_chunks_mut::<2>().0 {
                     let s = nearest_q14_sample(pcm_bytes, pcm_len, fp);
-                    acc[out_idx] = acc[out_idx].wrapping_add(s.wrapping_mul(vol_l));
-                    acc[out_idx + 1] = acc[out_idx + 1].wrapping_add(s.wrapping_mul(vol_r));
-                    out_idx += 2;
+                    pair[0] = pair[0].wrapping_add(s.wrapping_mul(vol_l));
+                    pair[1] = pair[1].wrapping_add(s.wrapping_mul(vol_r));
                     fp = fp.wrapping_add(step);
                 }
+                block_idx += 1;
             } else if loop_delta != 0 {
-                for _ in 0..4 {
+                let block = &mut acc[block_idx * 8..(block_idx + 1) * 8];
+                for pair in block.as_chunks_mut::<2>().0 {
                     let s = nearest_q14_sample(pcm_bytes, pcm_len, fp);
-                    acc[out_idx] = acc[out_idx].wrapping_add(s.wrapping_mul(vol_l));
-                    acc[out_idx + 1] = acc[out_idx + 1].wrapping_add(s.wrapping_mul(vol_r));
-                    out_idx += 2;
+                    pair[0] = pair[0].wrapping_add(s.wrapping_mul(vol_l));
+                    pair[1] = pair[1].wrapping_add(s.wrapping_mul(vol_r));
                     fp = fp.wrapping_add(step);
                     while fp >= end_fp {
                         fp = fp.wrapping_add(loop_delta as u32);
                     }
                 }
+                block_idx += 1;
             } else {
+                let mut out_idx = block_idx * 8;
                 loop {
                     let s = nearest_q14_sample(pcm_bytes, pcm_len, fp);
                     acc[out_idx] = acc[out_idx].wrapping_add(s.wrapping_mul(vol_l));
@@ -510,13 +755,59 @@ impl AccuracySynth {
         let end_fp = voice.end_q14;
         let loop_delta = voice.loop_delta_q14();
         let vol = voice.vol_l;
-        let mut fp = voice.phase_q14;
-        let mut out_idx = 0usize;
+        let max_safe_fp = (pcm_len.min(0x3_FFFF) as u32) << 14;
+        let can_interior = step < (1 << 30) && end_fp <= max_safe_fp;
 
-        for _ in 0..blocks {
+        let mut fp = voice.phase_q14;
+        let mut block_idx = 0usize;
+
+        while block_idx < blocks {
+            if can_interior && fp < end_fp {
+                let run_blocks = if step4 == 0 {
+                    blocks - block_idx
+                } else {
+                    (((end_fp - 1 - fp) as u64) / (step4 as u64)) as usize
+                }
+                .min(blocks - block_idx);
+
+                if run_blocks > 0 {
+                    let slice = &mut acc[block_idx * 4..(block_idx + run_blocks) * 4];
+                    for chunk in slice.as_chunks_mut::<4>().0 {
+                        let mut r0 = chunk[0];
+                        let mut r2 = chunk[2];
+
+                        let s0 = pcm_bytes[(fp >> 14) as usize] as i8 as i32;
+                        r0 = r0.wrapping_add(s0.wrapping_mul(vol));
+                        fp = fp.wrapping_add(step);
+
+                        let s1 = pcm_bytes[(fp >> 14) as usize] as i8 as i32;
+                        // Authentic ARM7TDMI instruction at +0xB58: `mla r1, r4, sb, r2`
+                        let r1 = r2.wrapping_add(s1.wrapping_mul(vol));
+                        fp = fp.wrapping_add(step);
+
+                        let s2 = pcm_bytes[(fp >> 14) as usize] as i8 as i32;
+                        r2 = r2.wrapping_add(s2.wrapping_mul(vol));
+                        fp = fp.wrapping_add(step);
+
+                        let s3 = pcm_bytes[(fp >> 14) as usize] as i8 as i32;
+                        // Authentic ARM7TDMI instruction at +0xB78: `mla r3, r4, sb, r2`
+                        let r3 = r2.wrapping_add(s3.wrapping_mul(vol));
+                        fp = fp.wrapping_add(step);
+
+                        chunk[0] = r0;
+                        chunk[1] = r1;
+                        chunk[2] = r2;
+                        chunk[3] = r3;
+                    }
+                    block_idx += run_blocks;
+                    continue;
+                }
+            }
+
             if fp.wrapping_add(step4) < end_fp {
-                let mut r0 = acc[out_idx];
-                let mut r2 = acc[out_idx + 2];
+                let chunk = &mut acc[block_idx * 4..(block_idx + 1) * 4];
+                let mut r0 = chunk[0];
+                let mut r2 = chunk[2];
 
                 let s0 = nearest_q14_sample(pcm_bytes, pcm_len, fp);
                 r0 = r0.wrapping_add(s0.wrapping_mul(vol));
@@ -536,22 +827,23 @@ impl AccuracySynth {
                 let r3 = r2.wrapping_add(s3.wrapping_mul(vol));
                 fp = fp.wrapping_add(step);
 
-                acc[out_idx] = r0;
-                acc[out_idx + 1] = r1;
-                acc[out_idx + 2] = r2;
-                acc[out_idx + 3] = r3;
-                out_idx += 4;
+                chunk[0] = r0;
+                chunk[1] = r1;
+                chunk[2] = r2;
+                chunk[3] = r3;
+                block_idx += 1;
             } else if loop_delta != 0 {
-                for _ in 0..4 {
+                for out in &mut acc[block_idx * 4..(block_idx + 1) * 4] {
                     let s = nearest_q14_sample(pcm_bytes, pcm_len, fp);
-                    acc[out_idx] = acc[out_idx].wrapping_add(s.wrapping_mul(vol));
-                    out_idx += 1;
+                    *out = out.wrapping_add(s.wrapping_mul(vol));
                     fp = fp.wrapping_add(step);
                     while fp >= end_fp {
                         fp = fp.wrapping_add(loop_delta as u32);
                     }
                 }
+                block_idx += 1;
             } else {
+                let mut out_idx = block_idx * 4;
                 loop {
                     let s = nearest_q14_sample(pcm_bytes, pcm_len, fp);
                     acc[out_idx] = acc[out_idx].wrapping_add(s.wrapping_mul(vol));
@@ -587,24 +879,24 @@ impl AccuracySynth {
         if state.cutoff < 0x80 {
             let alpha = (state.cutoff as i32) << 1;
             let beta = 256 - alpha;
-            for i in 0..frames {
-                let xl = acc_interleaved[i * 2];
-                let xr = acc_interleaved[i * 2 + 1];
+            for pair in acc_interleaved[..frames * 2].as_chunks_mut::<2>().0 {
+                let xl = pair[0];
+                let xr = pair[1];
                 st_l = (beta.wrapping_mul(xl).wrapping_add(alpha.wrapping_mul(st_l))) >> 8;
                 st_r = (beta.wrapping_mul(xr).wrapping_add(alpha.wrapping_mul(st_r))) >> 8;
-                acc_interleaved[i * 2] = st_l;
-                acc_interleaved[i * 2 + 1] = st_r;
+                pair[0] = st_l;
+                pair[1] = st_r;
             }
         } else {
             let alpha = ((state.cutoff - 0x80) as i32) << 1;
             let beta = 256 - alpha;
-            for i in 0..frames {
-                let xl = acc_interleaved[i * 2];
-                let xr = acc_interleaved[i * 2 + 1];
+            for pair in acc_interleaved[..frames * 2].as_chunks_mut::<2>().0 {
+                let xl = pair[0];
+                let xr = pair[1];
                 let lp_l = (beta.wrapping_mul(xl).wrapping_add(alpha.wrapping_mul(st_l))) >> 8;
                 let lp_r = (beta.wrapping_mul(xr).wrapping_add(alpha.wrapping_mul(st_r))) >> 8;
-                acc_interleaved[i * 2] = xl.wrapping_sub(lp_l);
-                acc_interleaved[i * 2 + 1] = xr.wrapping_sub(lp_r);
+                pair[0] = xl.wrapping_sub(lp_l);
+                pair[1] = xr.wrapping_sub(lp_r);
                 st_l = lp_l;
                 st_r = lp_r;
             }
@@ -690,8 +982,8 @@ const fn lanczos_kernel(x: f64, a: f64) -> f64 {
     (sin_const(pi_x) / pi_x) * (sin_const(pi_x_a) / pi_x_a)
 }
 
-const fn build_lanczos3_lut() -> [[f32; 6]; LANCZOS_PHASES] {
-    let mut table = [[0.0f32; 6]; LANCZOS_PHASES];
+const fn build_lanczos3_lut() -> [[f32; 8]; LANCZOS_PHASES] {
+    let mut table = [[0.0f32; 8]; LANCZOS_PHASES];
     let mut p = 0usize;
     while p < LANCZOS_PHASES {
         let frac = (p as f64) / (LANCZOS_PHASES as f64);
@@ -716,7 +1008,7 @@ const fn build_lanczos3_lut() -> [[f32; 6]; LANCZOS_PHASES] {
     table
 }
 
-static LANCZOS3_LUT: [[f32; 6]; LANCZOS_PHASES] = build_lanczos3_lut();
+static LANCZOS3_LUT: [[f32; 8]; LANCZOS_PHASES] = build_lanczos3_lut();
 
 /// High-precision 48,000 Hz `f32` studio synthesizer with band-limited Lanczos windowed-sinc
 /// resampling and true equal-power stereo panning.
@@ -795,55 +1087,119 @@ impl StudioSynth {
         let loop_len_f = loop_start.map(|ls| (loop_end - ls) as f64);
 
         let mut p = *pos;
-        let use_lut = self.lanczos_a == 3;
-        let a_i32 = self.lanczos_a.max(1) as i32;
 
-        for i in 0..frames {
-            if p >= loop_end_f {
-                if let Some(ll) = loop_len_f {
-                    while p >= loop_end_f {
-                        p -= ll;
+        if self.lanczos_a == 3 {
+            const Q32_SCALE: f64 = 4_294_967_296.0;
+            let safe_end_f = loop_end.saturating_sub(3) as f64;
+            let step_fp = (step * Q32_SCALE) as u64;
+            let mut i = 0usize;
+
+            while i < frames {
+                if p >= loop_end_f {
+                    if let Some(ll) = loop_len_f {
+                        while p >= loop_end_f {
+                            p -= ll;
+                        }
+                    } else {
+                        *pos = p;
+                        return false;
                     }
-                } else {
-                    *pos = p;
-                    return false;
                 }
-            }
 
-            let idx = p as isize;
-            let frac = p - (idx as f64);
+                // Interior fast path: 32.32 fixed-point phase + zero boundary/wrap checks.
+                if loop_end >= 6 && p >= 2.0 && p < safe_end_f && step_fp > 0 {
+                    let rem = frames - i;
+                    let max_n = ((safe_end_f - p) / step) as usize;
+                    let mut n = max_n.min(rem);
+                    let fp = (p * Q32_SCALE) as u64;
+                    while n > 0 {
+                        let last_fp = fp.saturating_add(((n - 1) as u64).saturating_mul(step_fp));
+                        if ((last_fp >> 32) as usize) + 3 < loop_end {
+                            break;
+                        }
+                        n -= 1;
+                    }
+                    if n > 0 && (fp >> 32) >= 2 {
+                        let last_idx = ((fp.wrapping_add(((n - 1) as u64).wrapping_mul(step_fp)))
+                            >> 32) as usize;
+                        let src = &pcm[..last_idx + 4];
+                        let mut ph_shifted = fp - (2u64 << 32);
+                        for (ol, or) in out_l[i..i + n].iter_mut().zip(&mut out_r[i..i + n]) {
+                            let b0 = (ph_shifted >> 32) as usize;
+                            let phase = ((ph_shifted >> 22) as usize) & (LANCZOS_PHASES - 1);
+                            let w = &LANCZOS3_LUT[phase];
+                            // Load highest index first so LLVM merges all 6 bounds checks into 1
+                            let s5 = (src[b0 + 5] as i8) as f32;
+                            let s0 = (src[b0] as i8) as f32;
+                            let s1 = (src[b0 + 1] as i8) as f32;
+                            let s2 = (src[b0 + 2] as i8) as f32;
+                            let s3 = (src[b0 + 3] as i8) as f32;
+                            let s4 = (src[b0 + 4] as i8) as f32;
+                            let val = (s0 * w[0] + s1 * w[1])
+                                + (s2 * w[2] + s3 * w[3])
+                                + (s4 * w[4] + s5 * w[5]);
+                            *ol += val * scale_l;
+                            *or += val * scale_r;
+                            ph_shifted = ph_shifted.wrapping_add(step_fp);
+                        }
+                        p += (n as f64) * step;
+                        i += n;
+                        continue;
+                    }
+                }
 
-            let val = if use_lut {
+                // Boundary / wrap single-frame fallback
+                let idx = p as isize;
+                let frac = p - (idx as f64);
                 let phase = ((frac * (LANCZOS_PHASES as f64)) as usize).min(LANCZOS_PHASES - 1);
-                let weights = &LANCZOS3_LUT[phase];
-                let mut acc = 0.0f32;
-                for (k, &w) in weights.iter().enumerate() {
-                    let s_idx = idx + (k as isize) - 2;
-                    let s = fetch_sample_wrapped(pcm, s_idx, loop_start, loop_end);
-                    acc += s * w;
+                let w = &LANCZOS3_LUT[phase];
+                let val = (fetch_sample_wrapped(pcm, idx - 2, loop_start, loop_end) * w[0]
+                    + fetch_sample_wrapped(pcm, idx - 1, loop_start, loop_end) * w[1]
+                    + fetch_sample_wrapped(pcm, idx, loop_start, loop_end) * w[2])
+                    + (fetch_sample_wrapped(pcm, idx + 1, loop_start, loop_end) * w[3]
+                        + fetch_sample_wrapped(pcm, idx + 2, loop_start, loop_end) * w[4]
+                        + fetch_sample_wrapped(pcm, idx + 3, loop_start, loop_end) * w[5]);
+                out_l[i] += val * scale_l;
+                out_r[i] += val * scale_r;
+                p += step;
+                i += 1;
+            }
+        } else {
+            let a_i32 = self.lanczos_a.max(1) as i32;
+            let a_f64 = a_i32 as f64;
+            for (ol, or) in out_l[..frames].iter_mut().zip(&mut out_r[..frames]) {
+                if p >= loop_end_f {
+                    if let Some(ll) = loop_len_f {
+                        while p >= loop_end_f {
+                            p -= ll;
+                        }
+                    } else {
+                        *pos = p;
+                        return false;
+                    }
                 }
-                acc
-            } else {
+
+                let idx = p as isize;
+                let frac = p - (idx as f64);
                 let mut acc = 0.0f64;
                 let mut wsum = 0.0f64;
                 let mut k = -a_i32 + 1;
                 while k <= a_i32 {
-                    let w = lanczos_kernel(frac - (k as f64), a_i32 as f64);
+                    let w = lanczos_kernel(frac - (k as f64), a_f64);
                     let s = fetch_sample_wrapped(pcm, idx + (k as isize), loop_start, loop_end);
                     acc += (s as f64) * w;
                     wsum += w;
                     k += 1;
                 }
-                if wsum != 0.0 {
+                let val = if wsum != 0.0 {
                     (acc / wsum) as f32
                 } else {
                     0.0
-                }
-            };
-
-            out_l[i] += val * scale_l;
-            out_r[i] += val * scale_r;
-            p += step;
+                };
+                *ol += val * scale_l;
+                *or += val * scale_r;
+                p += step;
+            }
         }
 
         *pos = p;
@@ -875,6 +1231,27 @@ fn fetch_sample_wrapped(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn branchless_dma8_clamps_match_luts_exhaustively() {
+        // Test every single 9-bit / 10-bit LUT entry plus high-bit wraparound & low-bit noise
+        for base in -2048i32..=2048 {
+            for low in [0i32, 1, 63, 127] {
+                let acc = (base << 7).wrapping_add(low);
+                let idx_v1 = ((acc as u32) >> 7) as usize & 0x1FF;
+                let idx_v2 = ((acc as u32) >> 7) as usize & 0x3FF;
+                assert_eq!(clamp_dma8_v1(acc), KAEDE_CLAMP_LUT_512[idx_v1]);
+                assert_eq!(clamp_dma8_v2(acc), KAEDE_CLAMP_LUT_1024[idx_v2]);
+            }
+        }
+        // Extreme i32 boundary values
+        for acc in [i32::MIN, i32::MAX, -1, -128, 0, 127, -129, 0x7FFF_FFFF] {
+            let idx_v1 = ((acc as u32) >> 7) as usize & 0x1FF;
+            let idx_v2 = ((acc as u32) >> 7) as usize & 0x3FF;
+            assert_eq!(clamp_dma8_v1(acc), KAEDE_CLAMP_LUT_512[idx_v1]);
+            assert_eq!(clamp_dma8_v2(acc), KAEDE_CLAMP_LUT_1024[idx_v2]);
+        }
+    }
 
     #[test]
     fn studio_synth_renders_finite_stereo_audio() {

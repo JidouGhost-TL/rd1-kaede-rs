@@ -18,7 +18,7 @@ pub enum KaedeMixMode {
 }
 
 /// Playback state for a single Nintendo R&D1 Kaede software mixer voice.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct KaedeVoice {
     /// Current playback position in 18.14 fixed-point samples (`sample_index << 14 | frac`).
     pub phase_q14: u32,
@@ -104,7 +104,7 @@ impl KaedeVoice {
 }
 
 /// Filter and ring-buffer cursor state for Kaede's band-pass reverb / echo feedback delay tap.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct KaedeReverbState {
     /// Left (or mono) 1-pole high-pass / DC-blocker state accumulator.
     pub hp_l: i32,
@@ -127,7 +127,7 @@ pub struct KaedeReverbState {
 }
 
 /// State for Kaede's post-mix stereo 1-pole Low-Pass / High-Pass filter (ARM Kernel 10).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct KaedeFilterState {
     /// Left channel filter memory (`r2` in ARM Kernel 10).
     pub state_l: i32,
