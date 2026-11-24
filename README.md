@@ -28,7 +28,7 @@ The **Nintendo R&D1 "Kaede"** Standard MIDI (`MThd`) DirectSound engine powered 
 
 ## Supported Nintendo R&D1 Kaede Engine Revisions
 
-Auditing all 3,236 unique GBA ROMs in the corpus identifies **12 commercial Nintendo R&D1 releases** across **2 distinct ARM7TDMI mixer revisions** (both sharing the exact 3,476-byte `0xD94` IWRAM ARM mixer block, differing in the DMA8 clamping LUT mask at `+0x7F4`), all supported and byte-exact golden-tested via [`KaedeVersion`]:
+Auditing all 3,236 unique GBA ROMs in the corpus identifies **12 commercial Nintendo R&D1 releases** across **2 distinct ARM7TDMI mixer revisions** (both sharing the exact 3,476-byte `0xD94` IWRAM ARM mixer block, differing in the DMA8 clamping LUT mask at `+0x7F4`), all supported and byte-exact golden-tested via `KaedeVersion`:
 
 | Revision | Corpus Share | Representative Titles | Embedded MIDIs / Samples | DMA8 Clamping LUT | Wraparound Headroom (`acc >> 7`) |
 | --- | ---: | --- | --- | --- | --- |
@@ -80,6 +80,21 @@ Every single ARM7TDMI kernel in `AccuracySynth` is verified strictly byte-for-by
   12. `mono_nearest_quirk` (Kernel 9, 128 bytes — verifies authentic ARM fast-path `mla r1/r3, r4, sb, r2`)
   13. `stereo_filter_lpf` (Kernel 10, 256 bytes + filter state, `cutoff = 0x40`)
   14. `stereo_filter_hpf` (Kernel 10, 256 bytes + filter state, `cutoff = 0xC0`)
+
+---
+
+## Benchmarks
+
+```sh
+cargo bench --bench bench_audio
+```
+
+| Benchmark | Throughput |
+| --- | ---: |
+| `AccuracySynth::mix_stereo_linear + pack_stereo_to_dma8` (`V2Lut1024`, 128f) | ~821.2 MSamples/s |
+| `AccuracySynth::mix_stereo_direct_copy` (128f) | ~2.35 GSamples/s |
+| `AccuracySynth::apply_stereo_reverb + apply_stereo_filter` (128f) | ~387.2 MSamples/s |
+| `StudioSynth::render_voice_f32` (48 kHz Lanczos-3, 1,024f) | ~408.2 MSamples/s |
 
 ---
 

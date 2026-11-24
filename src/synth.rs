@@ -218,9 +218,7 @@ impl AccuracySynth {
                     pair[0] = pair[0].wrapping_add(s.wrapping_mul(vol_l));
                     pair[1] = pair[1].wrapping_add(s.wrapping_mul(vol_r));
                     fp = fp.wrapping_add(step);
-                    while fp >= end_fp {
-                        fp = fp.wrapping_add(loop_delta as u32);
-                    }
+                    fp = wrap_loop_q14(fp, end_fp, loop_delta);
                 }
                 block_idx += 1;
             } else {
@@ -331,9 +329,7 @@ impl AccuracySynth {
                     let s = interp_q14_sample(pcm_bytes, pcm_len, fp);
                     *out = out.wrapping_add(s.wrapping_mul(vol));
                     fp = fp.wrapping_add(step);
-                    while fp >= end_fp {
-                        fp = fp.wrapping_add(loop_delta as u32);
-                    }
+                    fp = wrap_loop_q14(fp, end_fp, loop_delta);
                 }
                 block_idx += 1;
             } else {
@@ -500,7 +496,7 @@ impl AccuracySynth {
                 }
                 pos += run_frames;
                 if pos >= len {
-                    pos -= len;
+                    pos %= len;
                 }
                 out_idx += run_frames;
                 rem_blocks -= run_blocks;
@@ -514,7 +510,7 @@ impl AccuracySynth {
                     *out = lp.wrapping_mul(vol);
                 }
                 if pos >= len {
-                    pos -= len;
+                    pos %= len;
                 }
                 out_idx += 4;
                 rem_blocks -= 1;
@@ -710,9 +706,7 @@ impl AccuracySynth {
                     pair[0] = pair[0].wrapping_add(s.wrapping_mul(vol_l));
                     pair[1] = pair[1].wrapping_add(s.wrapping_mul(vol_r));
                     fp = fp.wrapping_add(step);
-                    while fp >= end_fp {
-                        fp = fp.wrapping_add(loop_delta as u32);
-                    }
+                    fp = wrap_loop_q14(fp, end_fp, loop_delta);
                 }
                 block_idx += 1;
             } else {
@@ -837,9 +831,7 @@ impl AccuracySynth {
                     let s = nearest_q14_sample(pcm_bytes, pcm_len, fp);
                     *out = out.wrapping_add(s.wrapping_mul(vol));
                     fp = fp.wrapping_add(step);
-                    while fp >= end_fp {
-                        fp = fp.wrapping_add(loop_delta as u32);
-                    }
+                    fp = wrap_loop_q14(fp, end_fp, loop_delta);
                 }
                 block_idx += 1;
             } else {
@@ -905,6 +897,19 @@ impl AccuracySynth {
         state.state_l = st_l;
         state.state_r = st_r;
     }
+}
+
+#[inline(always)]
+fn wrap_loop_q14(mut fp: u32, end_fp: u32, loop_delta: i32) -> u32 {
+    if fp >= end_fp {
+        let loop_len = (-(loop_delta as i64)) as u32;
+        fp = fp.wrapping_sub(loop_len);
+        if fp >= end_fp && loop_len > 0 {
+            let ls = end_fp.wrapping_sub(loop_len);
+            fp = ls + ((fp - ls) % loop_len);
+        }
+    }
+    fp
 }
 
 #[inline(always)]
@@ -1044,7 +1049,11 @@ impl StudioSynth {
     #[inline]
     #[must_use]
     pub fn equal_power_pan(pan: f32) -> (f32, f32) {
-        let clamped = pan.clamp(-1.0, 1.0) as f64;
+        let clamped = if pan.is_finite() {
+            pan.clamp(-1.0, 1.0) as f64
+        } else {
+            0.0
+        };
         let angle = (clamped + 1.0) * core::f64::consts::FRAC_PI_4;
         (cos_const(angle) as f32, sin_const(angle) as f32)
     }
@@ -1066,9 +1075,19 @@ impl StudioSynth {
         out_r: &mut [f32],
     ) -> bool {
         let frames = out_l.len().min(out_r.len());
-        if frames == 0 || sample.is_empty() || self.output_rate_hz <= 0.0 || playback_rate_hz <= 0.0
+        if frames == 0
+            || sample.is_empty()
+            || !self.output_rate_hz.is_finite()
+            || self.output_rate_hz <= 0.0
+            || !playback_rate_hz.is_finite()
+            || playback_rate_hz <= 0.0
+            || !pos.is_finite()
+            || !gain.is_finite()
         {
             return false;
+        }
+        if *pos < 0.0 {
+            *pos = 0.0;
         }
 
         let (pan_l, pan_r) = Self::equal_power_pan(pan);
@@ -1084,6 +1103,7 @@ impl StudioSynth {
             _ => (None, pcm_len),
         };
         let loop_end_f = loop_end as f64;
+        let loop_start_f = loop_start.unwrap_or(0) as f64;
         let loop_len_f = loop_start.map(|ls| (loop_end - ls) as f64);
 
         let mut p = *pos;
@@ -1097,8 +1117,12 @@ impl StudioSynth {
             while i < frames {
                 if p >= loop_end_f {
                     if let Some(ll) = loop_len_f {
-                        while p >= loop_end_f {
-                            p -= ll;
+                        p -= ll;
+                        if p >= loop_end_f {
+                            p = loop_start_f + ((p - loop_start_f) % ll);
+                        }
+                        if p < loop_start_f {
+                            p = loop_start_f;
                         }
                     } else {
                         *pos = p;
@@ -1170,8 +1194,12 @@ impl StudioSynth {
             for (ol, or) in out_l[..frames].iter_mut().zip(&mut out_r[..frames]) {
                 if p >= loop_end_f {
                     if let Some(ll) = loop_len_f {
-                        while p >= loop_end_f {
-                            p -= ll;
+                        p -= ll;
+                        if p >= loop_end_f {
+                            p = loop_start_f + ((p - loop_start_f) % ll);
+                        }
+                        if p < loop_start_f {
+                            p = loop_start_f;
                         }
                     } else {
                         *pos = p;
@@ -1276,5 +1304,38 @@ mod tests {
         let mut pos2 = 0.0;
         assert!(studio_a2.render_voice_f32(&view, &mut pos2, 13_379.0, 0.9, 0.2, &mut l2, &mut r2));
         assert!(l2.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn malformed_inputs_never_hang_or_panic() {
+        let pcm = [32u8; 16];
+        let view = KaedeSampleView::from_pcm_bytes(0, 13_379, 60, Some((0, 16)), &pcm);
+        let studio = StudioSynth::default();
+        let mut l = [0.0f32; 16];
+        let mut r = [0.0f32; 16];
+
+        // Non-finite inputs must bail out cleanly without hanging or poisoning buffers
+        let mut pos_inf = f64::INFINITY;
+        assert!(!studio.render_voice_f32(&view, &mut pos_inf, 13_379.0, 1.0, 0.0, &mut l, &mut r));
+        let mut pos_nan = f64::NAN;
+        assert!(!studio.render_voice_f32(&view, &mut pos_nan, 13_379.0, 1.0, 0.0, &mut l, &mut r));
+        let mut pos_huge = 1e15;
+        assert!(studio.render_voice_f32(&view, &mut pos_huge, 13_379.0, 1.0, f32::NAN, &mut l, &mut r));
+        assert!(l.iter().all(|v| v.is_finite()));
+        assert!(r.iter().all(|v| v.is_finite()));
+
+        // Short (< 4 byte) mono reverb delay buffer must not underflow
+        let mut rev = KaedeReverbState {
+            hp_shift: 3,
+            lp_shift: 2,
+            reverb_vol: 16,
+            ..Default::default()
+        };
+        let mut acc = [0i32; 16];
+        AccuracySynth::apply_mono_reverb(&[10], &mut rev, &mut acc);
+
+        // Huge starting phase in looped Q14 mixer must wrap in O(1)
+        let mut voice = KaedeVoice::new(0xFFFF_0000, 16, Some(15), 0x4000, 64, 64);
+        AccuracySynth::mix_stereo_linear(&pcm, &mut voice, &mut acc);
     }
 }

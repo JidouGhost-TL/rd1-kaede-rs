@@ -28,6 +28,27 @@
 //!     general Lanczos-`a` fallback) and equal-power stereo panning.
 //! - **Byte-exact `libmgba` ARM golden tested**: all 14 ARM7TDMI golden vectors across both
 //!   revisions verified strictly byte-for-byte (`assert_eq!`, zero tolerance).
+//!
+//! ## Quickstart
+//!
+//! ```rust
+//! use rd1_kaede::{AccuracySynth, KaedeFilterState, KaedeVersion, KaedeVoice};
+//!
+//! // Raw signed 8-bit PCM waveform (0 = silence)
+//! let pcm: &[u8] = &[0, 32, 64, 96, 127, 96, 64, 32, 0, 224, 192, 160, 128, 160, 192, 224];
+//!
+//! // Stereo linear-interpolated looped voice, 1.25x pitch (0x5000 in 18.14 fixed point)
+//! let mut voice = KaedeVoice::new(0, pcm.len(), Some(0), 0x5000, 110, 85);
+//! let mut acc = [0i32; 64]; // 32 interleaved stereo frames
+//! let mut flt = KaedeFilterState::new(0, 0, 0x30); // 1-pole LPF
+//! let mut dma_l = [0i8; 32];
+//! let mut dma_r = [0i8; 32];
+//!
+//! AccuracySynth::mix_stereo_linear(pcm, &mut voice, &mut acc);
+//! AccuracySynth::apply_stereo_filter(&mut flt, &mut acc);
+//! AccuracySynth::pack_stereo_to_dma8(KaedeVersion::V2Lut1024, &acc, &mut dma_l, &mut dma_r);
+//! assert!(dma_l.iter().any(|&s| s != 0));
+//! ```
 
 #![cfg_attr(not(feature = "std"), no_std)]
 #![deny(unsafe_code)]
