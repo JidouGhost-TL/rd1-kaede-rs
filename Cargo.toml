@@ -1,6 +1,6 @@
 [package]
 name = "rd1-kaede"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 authors = ["The gbakit Authors"]
 description = "Pure Rust, zero-dependency parser, software synthesizer, and byte-exact golden-tested emulator for the Nintendo R&D1 Kaede GBA Sound Engine"
